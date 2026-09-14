@@ -1,152 +1,279 @@
+/*
+  Project Nirvan — Arduino Firmware
+  - HC-SR04 ultrasonic on SG90 servo (scans center/left/right)
+  - L298N driving 2 motor banks (skid-steer)
+  - MQ-135, MQ-136, MQ-2 gas sensors
+  - Buzzer: warning/danger audible alert (thresholds from repo README)
+  - Serial link to Raspberry Pi (115200 baud): sends telemetry,
+    receives MODE:A / MODE:M / CMD:F/B/L/R/S
+  Library required: NewPing
+*/
+
 #include <Servo.h>
+#include <NewPing.h>
 
-// --- PIN DEFINITIONS ---
-// L298N Motor Driver
-const int IN1 = 2;
-const int IN2 = 3;
-const int IN3 = 4;
-const int IN4 = 5;
+// ---------- L298N control pins ----------
+const int LeftMotorForward   = 7;
+const int LeftMotorBackward  = 6;
+const int RightMotorForward  = 5;
+const int RightMotorBackward = 4;
 
-// HC-SR04 Ultrasonic Sensor
-const int TRIG_PIN = 6;
-const int ECHO_PIN = 7;
+// ---------- Ultrasonic sensor pins ----------
+#define TRIG_PIN A1
+#define ECHO_PIN A2
+#define MAX_DISTANCE 200   // cm
 
-// SG90 Servo
-const int SERVO_PIN = 11;
+// ---------- Servo ----------
+#define SERVO_PIN 10
+const int SERVO_CENTER = 90;
+const int SERVO_RIGHT  = 30;
+const int SERVO_LEFT   = 150;
 
-// MQ Gas Sensors (Analog Inputs)
-const int MQ_PIN_1 = A0;
-const int MQ_PIN_2 = A1;
-const int MQ_PIN_3 = A2;
+// ---------- Gas sensor pins ----------
+#define MQ135_PIN A0   // air quality: CO2, NH3, benzene, smoke
+#define MQ136_PIN A3   // H2S, SO2
+#define MQ2_PIN   A4   // LPG, methane, smoke, CO
 
-// --- VARIABLES & OBJECTS ---
-Servo radarServo;
-bool autonomousMode = true; // Starts in Auto mode by default
+const int MQ135_THRESHOLD = 400;
+const int MQ136_THRESHOLD = 400;
+const int MQ2_THRESHOLD   = 400;
+
+// ---------- Buzzer ----------
+#define BUZZER_PIN 8
+const int GAS_WARNING_THRESHOLD = 350;   // from repo README safety banner
+const int GAS_DANGER_THRESHOLD  = 650;   // from repo README safety banner
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+const unsigned long BUZZER_WARNING_INTERVAL = 500;  // slow beep
+const unsigned long BUZZER_DANGER_INTERVAL  = 150;  // fast beep
+
+// ---------- Behavior tuning ----------
+const int STOP_DISTANCE = 30;   // cm, matches README's documented 30cm logic
+
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
+Servo scanServo;
+
+boolean movingForward = false;
+bool autonomousMode = true;     // starts in Auto, same as before
+int distance = 100;
+
+int mq135Value = 0;
+int mq136Value = 0;
+int mq2Value   = 0;
+
 unsigned long lastTelemetryTime = 0;
-const unsigned long telemetryInterval = 200; // Send data every 200ms
+const unsigned long telemetryInterval = 200; // ms, unchanged from before
 
 void setup() {
-  Serial.begin(115200); // High baud rate for fast Pi communication
- 
-  // Initialize Motor Pins
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
- 
-  // Initialize Ultrasonic Pins
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
- 
-  // Initialize Servo
-  radarServo.attach(SERVO_PIN);
-  radarServo.write(90); // Look straight ahead
- 
-  stopMotors();
+  Serial.begin(115200);   // matches app.py's BAUD_RATE
+
+  pinMode(LeftMotorForward, OUTPUT);
+  pinMode(LeftMotorBackward, OUTPUT);
+  pinMode(RightMotorForward, OUTPUT);
+  pinMode(RightMotorBackward, OUTPUT);
+
+  pinMode(MQ135_PIN, INPUT);
+  pinMode(MQ136_PIN, INPUT);
+  pinMode(MQ2_PIN, INPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  scanServo.attach(SERVO_PIN);
+  scanServo.write(SERVO_CENTER);
+  delay(2000);
+
+  for (int i = 0; i < 4; i++) {
+    distance = readPing();
+    delay(100);
+  }
+
+  moveStop();
 }
 
 void loop() {
   // 1. Check for incoming commands from Raspberry Pi
   checkSerialCommands();
 
-  // 2. Handle Movement Logic Based on Mode
-  if (autonomousMode) {
-    runObstacleAvoidance();
-  }
+  // 2. Read gas sensors (updates globals + returns alert flag)
+  bool gasAlert = checkGasSensors();
 
-  // 3. Send Sensor Data to Pi at regular intervals
+  // 3. Update buzzer based on repo's warning/danger thresholds
+  updateBuzzer();
+
+  // 4. Movement logic
+  if (gasAlert) {
+    // Gas threshold breached: stop regardless of mode, for safety
+    moveStop();
+    if (autonomousMode) distance = readPing();
+  }
+  else if (autonomousMode) {
+    runObstacleAvoidance();
+    distance = readPing();
+  }
+  // else: manual mode, no gas alert -> motors stay as last set by checkSerialCommands()
+
+  // 5. Send telemetry to Pi at regular intervals
   if (millis() - lastTelemetryTime >= telemetryInterval) {
     sendTelemetry();
     lastTelemetryTime = millis();
   }
 }
 
-// --- NAVIGATION & SENSORS ---
-long getDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
-  long distance = duration * 0.034 / 2;
-  return (distance == 0) ? 999 : distance; // Return 999 if timeout out (clear path)
-}
-
+// ---------- Obstacle avoidance ----------
 void runObstacleAvoidance() {
-  long distanceAhead = getDistance();
- 
-  if (distanceAhead > 30) {
-    moveForward();
-  } else {
-    stopMotors();
-    delay(200);
-   
-    // Look Left
-    radarServo.write(150);
+  if (distance <= STOP_DISTANCE) {
+    moveStop();
+    delay(300);
+    moveBackward();
     delay(400);
-    long leftDist = getDistance();
-   
-    // Look Right
-    radarServo.write(30);
-    delay(400);
-    long rightDist = getDistance();
-   
-    // Return to Center
-    radarServo.write(90);
-    delay(200);
-   
-    // Make Decision
-    if (leftDist > rightDist && leftDist > 30) {
-      turnLeft();
-      delay(500); // Turn for half a second
-    } else if (rightDist > leftDist && rightDist > 30) {
+    moveStop();
+    delay(300);
+
+    int distanceRight = lookRight();
+    delay(300);
+    int distanceLeft = lookLeft();
+    delay(300);
+
+    if (distanceRight >= distanceLeft) {
       turnRight();
-      delay(500);
     } else {
-      moveBackward();
-      delay(600);
       turnLeft();
-      delay(500);
     }
-    stopMotors();
+    moveStop();
+  } else {
+    moveForward();
   }
 }
 
-// --- MOTOR ACTUATION ---
-void moveForward() {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-}
-void moveBackward() {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
-}
-void turnLeft() {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-}
-void turnRight() {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
-}
-void stopMotors() {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+// ---------- Gas sensors ----------
+bool checkGasSensors() {
+  mq135Value = analogRead(MQ135_PIN);
+  mq136Value = analogRead(MQ136_PIN);
+  mq2Value   = analogRead(MQ2_PIN);
+
+  return (mq135Value > MQ135_THRESHOLD) ||
+         (mq136Value > MQ136_THRESHOLD) ||
+         (mq2Value   > MQ2_THRESHOLD);
 }
 
-// --- SERIAL COMMUNICATION ---
+// ---------- Buzzer ----------
+void updateBuzzer() {
+  int maxGas = mq135Value;
+  if (mq136Value > maxGas) maxGas = mq136Value;
+  if (mq2Value   > maxGas) maxGas = mq2Value;
+
+  unsigned long now = millis();
+
+  if (maxGas >= GAS_DANGER_THRESHOLD) {
+    // Danger: fast beep
+    if (now - lastBuzzerToggle >= BUZZER_DANGER_INTERVAL) {
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState);
+      lastBuzzerToggle = now;
+    }
+  } else if (maxGas >= GAS_WARNING_THRESHOLD) {
+    // Warning: slow beep
+    if (now - lastBuzzerToggle >= BUZZER_WARNING_INTERVAL) {
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState);
+      lastBuzzerToggle = now;
+    }
+  } else {
+    // Normal: silent
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerState = false;
+  }
+}
+
+// ---------- Scanning ----------
+int lookRight() {
+  scanServo.write(SERVO_RIGHT);
+  delay(500);
+  int d = readPing();
+  delay(100);
+  scanServo.write(SERVO_CENTER);
+  return d;
+}
+
+int lookLeft() {
+  scanServo.write(SERVO_LEFT);
+  delay(500);
+  int d = readPing();
+  delay(100);
+  scanServo.write(SERVO_CENTER);
+  return d;
+}
+
+int readPing() {
+  delay(70);
+  int cm = sonar.ping_cm();
+  if (cm == 0) cm = 250;   // no echo = treat as clear
+  return cm;
+}
+
+// ---------- Motor control ----------
+void moveStop() {
+  digitalWrite(LeftMotorForward, LOW);
+  digitalWrite(RightMotorForward, LOW);
+  digitalWrite(LeftMotorBackward, LOW);
+  digitalWrite(RightMotorBackward, LOW);
+  movingForward = false;
+}
+
+void moveForward() {
+  if (!movingForward) {
+    movingForward = true;
+    digitalWrite(LeftMotorForward, HIGH);
+    digitalWrite(RightMotorForward, HIGH);
+    digitalWrite(LeftMotorBackward, LOW);
+    digitalWrite(RightMotorBackward, LOW);
+  }
+}
+
+void moveBackward() {
+  movingForward = false;
+  digitalWrite(LeftMotorBackward, HIGH);
+  digitalWrite(RightMotorBackward, HIGH);
+  digitalWrite(LeftMotorForward, LOW);
+  digitalWrite(RightMotorForward, LOW);
+}
+
+void turnRight() {
+  digitalWrite(LeftMotorForward, HIGH);
+  digitalWrite(RightMotorBackward, HIGH);
+  digitalWrite(LeftMotorBackward, LOW);
+  digitalWrite(RightMotorForward, LOW);
+  delay(250);
+
+  digitalWrite(LeftMotorForward, HIGH);
+  digitalWrite(RightMotorForward, HIGH);
+  digitalWrite(LeftMotorBackward, LOW);
+  digitalWrite(RightMotorBackward, LOW);
+  movingForward = true;
+}
+
+void turnLeft() {
+  digitalWrite(LeftMotorBackward, HIGH);
+  digitalWrite(RightMotorForward, HIGH);
+  digitalWrite(LeftMotorForward, LOW);
+  digitalWrite(RightMotorBackward, LOW);
+  delay(250);
+
+  digitalWrite(LeftMotorForward, HIGH);
+  digitalWrite(RightMotorForward, HIGH);
+  digitalWrite(LeftMotorBackward, LOW);
+  digitalWrite(RightMotorBackward, LOW);
+  movingForward = true;
+}
+
+// ---------- Serial communication ----------
 void sendTelemetry() {
-  int gas1 = analogRead(MQ_PIN_1);
-  int gas2 = analogRead(MQ_PIN_2);
-  int gas3 = analogRead(MQ_PIN_3);
-  long dist = getDistance();
- 
   // Format: GAS1:val,GAS2:val,GAS3:val,DIST:val,MODE:A/M
-  Serial.print("GAS1:"); Serial.print(gas1);
-  Serial.print(",GAS2:"); Serial.print(gas2);
-  Serial.print(",GAS3:"); Serial.print(gas3);
-  Serial.print(",DIST:"); Serial.print(dist);
+  Serial.print("GAS1:"); Serial.print(mq2Value);    // MQ-2  -> GAS1 (matches README mapping)
+  Serial.print(",GAS2:"); Serial.print(mq135Value);  // MQ-135 -> GAS2
+  Serial.print(",GAS3:"); Serial.print(mq136Value);  // MQ-136 -> GAS3
+  Serial.print(",DIST:"); Serial.print(distance);
   Serial.print(",MODE:"); Serial.println(autonomousMode ? "A" : "M");
 }
 
@@ -154,23 +281,21 @@ void checkSerialCommands() {
   if (Serial.available() > 0) {
     String command = Serial.readStringUntil('\n');
     command.trim();
-   
-    // Handle Mode Changes
+
     if (command == "MODE:A") {
       autonomousMode = true;
     }
     else if (command == "MODE:M") {
       autonomousMode = false;
-      stopMotors(); // Instantly stop when switching to manual
+      moveStop();
     }
-   
-    // Handle Manual Steering Commands (Only executed if in Manual Mode)
+
     if (!autonomousMode) {
       if (command == "CMD:F") moveForward();
       else if (command == "CMD:B") moveBackward();
       else if (command == "CMD:L") turnLeft();
       else if (command == "CMD:R") turnRight();
-      else if (command == "CMD:S") stopMotors();
+      else if (command == "CMD:S") moveStop();
     }
   }
 }
