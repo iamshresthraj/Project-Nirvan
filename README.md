@@ -1,7 +1,7 @@
 # Project Nirvan: Autonomous Sewer and Pipeline Inspection Robot
 
-Project Nirvan is an autonomous, dual-controller inspection rover designed to navigate hazardous, GPS-denied underground environments such as pipelines, sewer systems, and industrial conduits. The system combines real-time multi-gas detection, thermal infrared imaging, ultrasonic obstacle avoidance, and web-based telemetry and manual control.
 
+Project Nirvan is an autonomous, dual-controller inspection rover designed to navigate hazardous, GPS-denied underground environments such as pipelines, sewer systems, and industrial conduits. The system combines real-time multi-gas detection, thermal infrared imaging, ultrasonic obstacle avoidance, and web-based telemetry and manual control.
 ---
 
 ## Table of Contents
@@ -36,6 +36,10 @@ Project Nirvan is an autonomous, dual-controller inspection rover designed to na
 ---
 
 ## Overview
+
+### Project Demo
+[![Watch the Demo](https://img.youtube.com/vi/8IM5mLFAT-4/maxresdefault.jpg)](https://youtu.be/8IM5mLFAT-4)
+
 
 Operating inside confined subterranean networks presents multiple hazards, including toxic gas accumulation, structural collapses, and zero visual line-of-sight. Project Nirvan addresses these challenges through a distributed computing model:
 
